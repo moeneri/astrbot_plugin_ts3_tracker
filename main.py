@@ -2,12 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Optional
-from typing import Any
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, MessageChain, filter
+from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
 
@@ -55,9 +54,6 @@ class Ts3OnlineUser:
     connected_duration_seconds: int
     away: bool
 
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
 
 @dataclass
 class Ts3ServerStatus:
@@ -67,16 +63,6 @@ class Ts3ServerStatus:
     online_count: int
     channel_names: list[str]
     users: list[Ts3OnlineUser]
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "server_name": self.server_name,
-            "server_host": self.server_host,
-            "server_port": self.server_port,
-            "online_count": self.online_count,
-            "channel_names": self.channel_names,
-            "users": [user.to_dict() for user in self.users],
-        }
 
 
 class Ts3QueryClient:
@@ -88,7 +74,6 @@ class Ts3QueryClient:
         password: str,
         query_port: int = 10011,
         timeout: float = 10.0,
-        debug: bool = False,
     ):
         self.host = host
         self.server_port = server_port
@@ -96,7 +81,6 @@ class Ts3QueryClient:
         self.username = username
         self.password = password
         self.timeout = timeout
-        self.debug = debug
 
     async def fetch_status(self) -> Ts3ServerStatus:
         try:
@@ -123,25 +107,9 @@ class Ts3QueryClient:
             client_records = await self._execute(
                 reader,
                 writer,
-                "clientlist -uid -away -ip",
+                "clientlist -uid -away -ip -times",
                 "clientlist",
             )
-
-            client_details: dict[str, dict[str, str]] = {}
-            for client in client_records:
-                if client.get("client_type") == "1":
-                    continue
-                client_id = client.get("clid", "")
-                if not client_id:
-                    continue
-                detail_records = await self._execute(
-                    reader,
-                    writer,
-                    f"clientinfo clid={client_id}",
-                    "clientinfo",
-                )
-                client_details[client_id] = detail_records[0] if detail_records else {}
-
             await self._write_line(writer, "quit")
         finally:
             writer.close()
@@ -164,19 +132,17 @@ class Ts3QueryClient:
             if client.get("client_type") == "1":
                 continue
 
-            client_id = client.get("clid", "")
-            detail = client_details.get(client_id, {})
             users.append(
                 Ts3OnlineUser(
                     nickname=client.get("client_nickname", ""),
                     channel_name=channels.get(client.get("cid", ""), ""),
-                    client_id=client_id,
+                    client_id=client.get("clid", ""),
                     database_id=client.get("client_database_id", ""),
                     unique_id=client.get("client_unique_identifier", ""),
                     client_ip=client.get("connection_client_ip", ""),
                     connected_duration_seconds=max(
                         0,
-                        int(detail.get("connection_connected_time", "0") or "0") // 1000,
+                        int(client.get("connection_connected_time", "0") or "0") // 1000,
                     ),
                     away=client.get("client_away", "0") == "1",
                 )
@@ -306,14 +272,12 @@ class Ts3QueryClient:
 
 @register(
     "ts3_tracker",
-    "Codex",
-    "QQ 发送“上号”后返回 TeamSpeak 3 服务器在线信息。",
-    "1.0.0",
-    "",
+    "moeneri",
+    "AstrBot TS3 查询插件，发送上号指令即可返回服务器在线信息。",
+    "1.0.1",
+    "https://github.com/moeneri/astrbot_plugin_ts3_tracker",
 )
 class Ts3TrackerPlugin(Star):
-    PLAIN_TEXT_TRIGGERS = {"上号"}
-
     def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
         super().__init__(context)
         self.config = config or {}
@@ -322,21 +286,6 @@ class Ts3TrackerPlugin(Star):
     async def query_server_status(self, event: AstrMessageEvent):
         """查询 TS3 服务器在线信息。"""
         message = await self._build_server_message()
-        if await self._send_text_response(event, message):
-            return
-        yield event.plain_result(message)
-
-    @filter.event_message_type(filter.EventMessageType.ALL)
-    async def query_server_status_plain(self, event: AstrMessageEvent):
-        """支持直接发送“上号”触发查询。"""
-        content = (event.message_str or "").strip()
-        if content not in self.PLAIN_TEXT_TRIGGERS:
-            return
-
-        event.stop_event()
-        message = await self._build_server_message()
-        if await self._send_text_response(event, message):
-            return
         yield event.plain_result(message)
 
     async def _build_server_message(self) -> str:
@@ -351,7 +300,6 @@ class Ts3TrackerPlugin(Star):
             username=str(self.config.get("serverquery_username", "")).strip(),
             password=str(self.config.get("serverquery_password", "")).strip(),
             timeout=10.0,
-            debug=self._get_bool_config("debug", False),
         )
 
         try:
@@ -409,25 +357,3 @@ class Ts3TrackerPlugin(Star):
             return int(self.config.get(key, default))
         except (TypeError, ValueError):
             return default
-
-    def _get_bool_config(self, key: str, default: bool = False) -> bool:
-        value = self.config.get(key, default)
-        if isinstance(value, bool):
-            return value
-        if isinstance(value, (int, float)):
-            return bool(value)
-        if isinstance(value, str):
-            return value.strip().lower() in {"1", "true", "yes", "on"}
-        return default
-
-    async def _send_text_response(self, event: AstrMessageEvent, text: str) -> bool:
-        target = getattr(event, "unified_msg_origin", "")
-        if not target:
-            return False
-
-        try:
-            await self.context.send_message(target, MessageChain().message(text))
-            return True
-        except Exception as exc:  # pragma: no cover - platform dependent
-            logger.warning("TS3 response send failed, fallback to plain_result: %s", exc)
-            return False
