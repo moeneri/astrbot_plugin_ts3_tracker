@@ -85,10 +85,14 @@ class Ts3QueryClient:
 
     async def fetch_status(self) -> Ts3ServerStatus:
         try:
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_connection(self.host, self.query_port),
-                timeout=self.timeout,
-            )
+            async with asyncio.timeout(self.timeout):
+                return await self._fetch_status_inner()
+        except TimeoutError as exc:
+            raise Ts3QueryError(f"TS3 查询超时（>{self.timeout:.0f}秒）") from exc
+
+    async def _fetch_status_inner(self) -> Ts3ServerStatus:
+        try:
+            reader, writer = await asyncio.open_connection(self.host, self.query_port)
         except Exception as exc:  # pragma: no cover - network dependent
             raise Ts3QueryError(
                 f"无法连接到 ServerQuery：{self.host}:{self.query_port} ({exc})"
@@ -96,6 +100,8 @@ class Ts3QueryClient:
 
         try:
             await self._consume_welcome(reader)
+            # ServerQuery login is plaintext by protocol design. It is safest to use
+            # localhost, a private network, or a protected tunnel such as SSH/VPN.
             await self._execute(
                 reader,
                 writer,
@@ -179,9 +185,9 @@ class Ts3QueryClient:
         await writer.drain()
 
     async def _consume_welcome(self, reader: asyncio.StreamReader) -> None:
-        for _ in range(10):
+        while True:
             try:
-                raw_line = await asyncio.wait_for(reader.readline(), timeout=self.timeout)
+                raw_line = await reader.readline()
             except asyncio.TimeoutError:
                 logger.warning("TS3 ServerQuery welcome banner timed out")
                 return
@@ -196,21 +202,18 @@ class Ts3QueryClient:
             if line.startswith("error "):
                 return
             if "TeamSpeak 3 ServerQuery interface" in line:
-                continue
+                return
             if "Welcome to the TeamSpeak 3 ServerQuery interface" in line:
                 continue
-            logger.warning("Unexpected TS3 ServerQuery welcome line: %s", line)
-
-        logger.warning("TS3 ServerQuery welcome banner exceeded expected length")
+            logger.info("TS3 ServerQuery welcome line: %s", line)
 
     async def _read_response(self, reader: asyncio.StreamReader) -> list[str]:
         lines: list[str] = []
         while True:
             try:
-                raw_line = await asyncio.wait_for(reader.readline(), timeout=self.timeout)
-            except asyncio.TimeoutError as exc:
-                raise Ts3QueryError("ServerQuery 响应超时") from exc
-
+                raw_line = await reader.readline()
+            except Exception as exc:
+                raise Ts3QueryError(f"ServerQuery 读取响应失败：{exc}") from exc
             if not raw_line:
                 if lines:
                     return lines
