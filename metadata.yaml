@@ -1,0 +1,10 @@
+name: astrbot_plugin_ts3_tracker
+display_name: TS3 Query
+author: Codex
+description: AstrBot TS3 查询插件，QQ 发送“上号”即可返回服务器在线人数和频道信息。
+version: 1.0.0
+repo: ""
+astrbot_version: ">=4.16,<5"
+support_platforms:
+  - aiocqhttp
+  - qq_official
