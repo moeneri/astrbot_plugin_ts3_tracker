@@ -46,6 +46,7 @@ UNESCAPE_MAP = {
 @dataclass
 class Ts3OnlineUser:
     nickname: str
+    channel_id: str
     channel_name: str
     client_id: str
     database_id: str
@@ -61,7 +62,7 @@ class Ts3ServerStatus:
     server_host: str
     server_port: int
     online_count: int
-    channel_names: list[str]
+    channels: list[tuple[str, str]]
     users: list[Ts3OnlineUser]
 
 
@@ -121,10 +122,10 @@ class Ts3QueryClient:
             channel.get("cid", ""): channel.get("channel_name", "")
             for channel in channel_records
         }
-        channel_names = [
-            channel.get("channel_name", "")
+        channel_order = [
+            (channel.get("cid", ""), channel.get("channel_name", ""))
             for channel in channel_records
-            if channel.get("channel_name", "")
+            if channel.get("cid", "")
         ]
 
         users: list[Ts3OnlineUser] = []
@@ -135,6 +136,7 @@ class Ts3QueryClient:
             users.append(
                 Ts3OnlineUser(
                     nickname=client.get("client_nickname", ""),
+                    channel_id=client.get("cid", ""),
                     channel_name=channels.get(client.get("cid", ""), ""),
                     client_id=client.get("clid", ""),
                     database_id=client.get("client_database_id", ""),
@@ -150,12 +152,14 @@ class Ts3QueryClient:
 
         users.sort(key=lambda item: item.nickname.casefold())
 
+        server_port = self._safe_int(serverinfo.get("virtualserver_port"), self.server_port)
+
         return Ts3ServerStatus(
             server_name=serverinfo.get("virtualserver_name", ""),
             server_host=self.host,
-            server_port=int(serverinfo.get("virtualserver_port", self.server_port)),
+            server_port=server_port,
             online_count=len(users),
-            channel_names=channel_names,
+            channels=channel_order,
             users=users,
         )
 
@@ -175,13 +179,15 @@ class Ts3QueryClient:
         await writer.drain()
 
     async def _consume_welcome(self, reader: asyncio.StreamReader) -> None:
-        for _ in range(3):
+        for _ in range(10):
             try:
                 raw_line = await asyncio.wait_for(reader.readline(), timeout=self.timeout)
             except asyncio.TimeoutError:
+                logger.warning("TS3 ServerQuery welcome banner timed out")
                 return
 
             if not raw_line:
+                logger.warning("TS3 ServerQuery welcome banner ended unexpectedly")
                 return
 
             line = raw_line.decode("utf-8", errors="replace").strip("\r\n")
@@ -190,7 +196,12 @@ class Ts3QueryClient:
             if line.startswith("error "):
                 return
             if "TeamSpeak 3 ServerQuery interface" in line:
-                return
+                continue
+            if "Welcome to the TeamSpeak 3 ServerQuery interface" in line:
+                continue
+            logger.warning("Unexpected TS3 ServerQuery welcome line: %s", line)
+
+        logger.warning("TS3 ServerQuery welcome banner exceeded expected length")
 
     async def _read_response(self, reader: asyncio.StreamReader) -> list[str]:
         lines: list[str] = []
@@ -218,8 +229,14 @@ class Ts3QueryClient:
             return []
 
         error_line = lines[-1]
+        if not error_line.startswith("error "):
+            raise Ts3QueryError(f"{action} 失败：响应格式异常，缺少 error 行")
+
         error_info = self._parse_record(error_line.removeprefix("error "))
-        error_id = int(error_info.get("id", "-1"))
+        try:
+            error_id = int(error_info.get("id", "-1"))
+        except (TypeError, ValueError) as exc:
+            raise Ts3QueryError(f"{action} 失败：响应格式异常，error id 无法解析") from exc
         if error_id != 0:
             error_msg = error_info.get("msg", "unknown")
             raise Ts3QueryError(f"{action} 失败：{error_msg} (id={error_id})")
@@ -268,6 +285,12 @@ class Ts3QueryClient:
             index += 2
 
         return "".join(chars)
+
+    def _safe_int(self, value: object, default: int) -> int:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
 
 @register(
@@ -331,14 +354,30 @@ class Ts3TrackerPlugin(Star):
         return "\n".join(lines)
 
     def _group_users_by_channel(self, status: Ts3ServerStatus) -> list[tuple[str, list[str]]]:
-        grouped: dict[str, list[str]] = {}
-        for channel_name in status.channel_names:
-            grouped.setdefault(channel_name, [])
+        grouped: dict[str, dict[str, object]] = {}
+        for channel_id, channel_name in status.channels:
+            grouped.setdefault(channel_id, {"name": channel_name, "users": []})
 
         for user in status.users:
-            grouped.setdefault(user.channel_name or "未命名频道", []).append(user.nickname)
+            channel_id = user.channel_id or "__unknown__"
+            channel_entry = grouped.setdefault(
+                channel_id,
+                {"name": user.channel_name or "未命名频道", "users": []},
+            )
+            channel_entry["users"].append(user.nickname)
 
-        return list(grouped.items())
+        ordered_groups: list[tuple[str, list[str]]] = []
+        for channel_id, channel_name in status.channels:
+            channel_entry = grouped.get(channel_id)
+            if channel_entry is None:
+                continue
+            ordered_groups.append((str(channel_entry["name"]), list(channel_entry["users"])))
+            grouped.pop(channel_id, None)
+
+        for channel_entry in grouped.values():
+            ordered_groups.append((str(channel_entry["name"]), list(channel_entry["users"])))
+
+        return ordered_groups
 
     def _get_missing_required_fields(self) -> list[str]:
         missing: list[str] = []
