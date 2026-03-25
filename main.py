@@ -33,9 +33,9 @@ PLUGIN_NAME = "astrbot_plugin_ts3_tracker"
 
 @register(
     "ts3_tracker",
-    "moeneri",
+    "Codex",
     "查询 TeamSpeak 3 服务器在线用户，并持续推送进入、离开和在线时长通知。",
-    "1.0.2",
+    "1.0.1",
     "",
 )
 class Ts3TrackerPlugin(Star):
@@ -235,10 +235,7 @@ class Ts3TrackerPlugin(Star):
         if isinstance(status, str):
             return status
 
-        channel_members = self._group_users_by_channel(
-            status,
-            show_duration=self._show_status_online_duration(),
-        )
+        channel_members = self._group_users_by_channel(status)
         if not channel_members:
             return "没有人。"
 
@@ -375,17 +372,11 @@ class Ts3TrackerPlugin(Star):
         self._debug_log("TS3 query succeeded with %s online clients", status.online_count)
         return status
 
-    def _group_users_by_channel(
-        self,
-        status,
-        show_duration: bool = False,
-    ) -> list[tuple[str, list[str]]]:
+    def _group_users_by_channel(self, status) -> list[tuple[str, list[str]]]:
         grouped: dict[str, list[str]] = {}
         for user in status.users:
             channel_name = user.channel_name or "未知频道"
-            grouped.setdefault(channel_name, []).append(
-                self._build_user_label(user, show_duration=show_duration)
-            )
+            grouped.setdefault(channel_name, []).append(user.nickname)
 
         ordered: list[tuple[str, list[str]]] = []
         seen: set[str] = set()
@@ -404,18 +395,9 @@ class Ts3TrackerPlugin(Star):
         grouped: dict[str, list[str]] = {}
         for user in status.users:
             channel_name = user.channel_name or "未知频道"
-            grouped.setdefault(channel_name, []).append(
-                self._build_user_label(user, show_duration=True)
-            )
+            duration = format_duration(int(getattr(user, "connected_duration_seconds", 0)))
+            grouped.setdefault(channel_name, []).append(f"{user.nickname}({duration})")
         return grouped
-
-    def _build_user_label(self, user, show_duration: bool = False) -> str:
-        nickname = str(getattr(user, "nickname", "") or "-")
-        if not show_duration:
-            return nickname
-
-        duration = format_duration(int(getattr(user, "connected_duration_seconds", 0)))
-        return f"{nickname}({duration})"
 
     def _resolve_storage_dir(self) -> Path:
         try:
@@ -467,9 +449,6 @@ class Ts3TrackerPlugin(Star):
 
     def _debug_enabled(self) -> bool:
         return self._get_bool_config("debug", False)
-
-    def _show_status_online_duration(self) -> bool:
-        return self._get_bool_config("show_online_duration_in_status", False)
 
     def _ensure_monitor_task(self) -> None:
         if self.monitor_task and not self.monitor_task.done():

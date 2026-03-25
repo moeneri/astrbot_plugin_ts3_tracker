@@ -1,9 +1,9 @@
 name: astrbot_plugin_ts3_tracker
 display_name: TS3 Tracker
-author: moeneri
+author: Codex
 description: 查询并持续监控 TeamSpeak 3 服务器在线用户信息。
-version: 1.0.2
-repo: "https://github.com/moeneri/astrbot_plugin_ts3_tracker"
+version: 1.0.1
+repo: ""
 astrbot_version: ">=4.16,<5"
 support_platforms:
   - aiocqhttp

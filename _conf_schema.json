@@ -7,12 +7,12 @@
   "server_port": {
     "type": "int",
     "description": "TS3 语音服务器端口",
-    "hint": "通常为 9987"
+    "hint": "通常是 9987"
   },
   "serverquery_port": {
     "type": "int",
     "description": "ServerQuery 端口",
-    "hint": "通常为 10011，一般保持默认即可",
+    "hint": "通常是 10011，一般保持默认即可",
     "default": 10011
   },
   "serverquery_username": {
@@ -27,32 +27,26 @@
   "enable_plain_text_trigger": {
     "type": "bool",
     "description": "允许不带 / 的纯文本触发",
-    "hint": "开启后，直接发送 ts、上号、人呢、tsinfo、ts服务器 也可以触发查询",
-    "default": false
-  },
-  "show_online_duration_in_status": {
-    "type": "bool",
-    "description": "上号查询时显示在线时长",
-    "hint": "开启后，/ts、上号、人呢 的返回结果会显示为 test(23分钟) 这类格式",
+    "hint": "开启后，直接发送 ts、上号、人呢 也会触发查询",
     "default": false
   },
   "enable_monitor": {
     "type": "bool",
-    "description": "开启进入/离开监听",
-    "hint": "开启后插件会持续轮询 TS3 在线列表，并向已绑定的会话推送上线/离线通知",
+    "description": "开启进入/离开监控",
+    "hint": "开启后插件会持续轮询 TS3 在线列表，并向已绑定的会话推送上线/下线通知",
     "default": false
   },
   "monitor_interval_seconds": {
     "type": "int",
-    "description": "监听轮询间隔秒数",
-    "hint": "默认 5 秒，代码也会强制不低于 5 秒。请勿设置过低，过于频繁的查询可能触发 TS3 服务器限制",
+    "description": "监控轮询间隔秒数",
+    "hint": "默认 5 秒，代码也会强制不低于 5 秒。请勿设置过低，太频繁查询可能会被 TS3 服务器拉入黑名单。",
     "obvious_hint": true,
     "default": 5
   },
   "debug": {
     "type": "bool",
     "description": "输出详细调试日志",
-    "hint": "开启后会在 AstrBot 日志中输出更详细的 TS3 查询过程",
+    "hint": "开启后会在 AstrBot 日志中打印更详细的 TS3 查询过程",
     "default": false
   }
 }
