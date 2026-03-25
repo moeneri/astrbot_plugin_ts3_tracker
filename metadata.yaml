@@ -1,22 +1,10 @@
 name: astrbot_plugin_ts3_tracker
-display_name: TS3 Tracker
+display_name: TS3 Query
 author: moeneri
-description: 查询并持续监控 TeamSpeak 3 服务器在线用户信息。
+description: AstrBot TS3 查询插件，QQ 发送“上号”即可返回在线人数、频道信息，并可选显示在线时长。
 version: 1.0.2
 repo: "https://github.com/moeneri/astrbot_plugin_ts3_tracker"
 astrbot_version: ">=4.16,<5"
 support_platforms:
   - aiocqhttp
   - qq_official
-  - telegram
-  - wecom
-  - lark
-  - dingtalk
-  - discord
-  - slack
-  - kook
-  - vocechat
-  - weixin_official_account
-  - satori
-  - misskey
-  - line
