@@ -2,333 +2,364 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-from dataclasses import dataclass
+import sys
+import time
+from pathlib import Path
 from typing import Optional
 
 from astrbot.api import AstrBotConfig, logger
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.utils.astrbot_path import get_astrbot_data_path
+
+try:
+    from .notifications import build_offline_message, build_online_message, format_duration
+    from .presence import PresenceTracker
+    from .storage import PluginLocalStorage
+    from .ts3_query import Ts3QueryClient, Ts3QueryError
+except ImportError:
+    current_dir = Path(__file__).resolve().parent
+    if str(current_dir) not in sys.path:
+        sys.path.insert(0, str(current_dir))
+
+    from notifications import build_offline_message, build_online_message, format_duration
+    from presence import PresenceTracker
+    from storage import PluginLocalStorage
+    from ts3_query import Ts3QueryClient, Ts3QueryError
 
 
-class Ts3QueryError(Exception):
-    """Raised when a ServerQuery request fails."""
-
-
-ESCAPE_MAP = {
-    "\\": "\\\\",
-    "/": "\\/",
-    " ": "\\s",
-    "|": "\\p",
-    "\a": "\\a",
-    "\b": "\\b",
-    "\f": "\\f",
-    "\n": "\\n",
-    "\r": "\\r",
-    "\t": "\\t",
-    "\v": "\\v",
-}
-
-UNESCAPE_MAP = {
-    "\\\\": "\\",
-    "\\/": "/",
-    "\\s": " ",
-    "\\p": "|",
-    "\\a": "\a",
-    "\\b": "\b",
-    "\\f": "\f",
-    "\\n": "\n",
-    "\\r": "\r",
-    "\\t": "\t",
-    "\\v": "\v",
-}
-
-
-@dataclass
-class Ts3OnlineUser:
-    nickname: str
-    channel_id: str
-    channel_name: str
-    client_id: str
-    database_id: str
-    unique_id: str
-    client_ip: str
-    connected_duration_seconds: int
-    away: bool
-
-
-@dataclass
-class Ts3ServerStatus:
-    server_name: str
-    server_host: str
-    server_port: int
-    online_count: int
-    channels: list[tuple[str, str]]
-    users: list[Ts3OnlineUser]
-
-
-class Ts3QueryClient:
-    def __init__(
-        self,
-        host: str,
-        server_port: int,
-        username: str,
-        password: str,
-        query_port: int = 10011,
-        timeout: float = 10.0,
-        debug: bool = False,
-    ):
-        self.host = host
-        self.server_port = server_port
-        self.query_port = query_port
-        self.username = username
-        self.password = password
-        self.timeout = timeout
-        self.debug = debug
-
-    async def fetch_status(self) -> Ts3ServerStatus:
-        try:
-            async with asyncio.timeout(self.timeout):
-                return await self._fetch_status_inner()
-        except TimeoutError as exc:
-            raise Ts3QueryError(f"TS3 查询超时（超过 {self.timeout:.0f} 秒）") from exc
-
-    async def _fetch_status_inner(self) -> Ts3ServerStatus:
-        try:
-            reader, writer = await asyncio.open_connection(self.host, self.query_port)
-        except Exception as exc:  # pragma: no cover - network dependent
-            raise Ts3QueryError(
-                f"无法连接到 ServerQuery：{self.host}:{self.query_port} ({exc})"
-            ) from exc
-
-        try:
-            await self._consume_welcome(reader)
-            # ServerQuery 的 login 请求是明文传输。建议只在 localhost、内网
-            # 或通过 SSH/VPN 等受保护隧道访问时使用，避免凭据暴露在公网链路。
-            await self._execute(
-                reader,
-                writer,
-                f"login {self._escape(self.username)} {self._escape(self.password)}",
-                "login",
-            )
-            await self._execute(reader, writer, f"use port={self.server_port}", "use")
-            serverinfo_records = await self._execute(reader, writer, "serverinfo", "serverinfo")
-            channel_records = await self._execute(reader, writer, "channellist", "channellist")
-            client_records = await self._execute(
-                reader,
-                writer,
-                "clientlist -uid -away -ip -times",
-                "clientlist",
-            )
-            await self._write_line(writer, "quit")
-        finally:
-            writer.close()
-            with contextlib.suppress(Exception):
-                await writer.wait_closed()
-
-        serverinfo = serverinfo_records[0] if serverinfo_records else {}
-        channel_map = {
-            channel.get("cid", ""): channel.get("channel_name", "")
-            for channel in channel_records
-            if channel.get("cid", "")
-        }
-        channel_order = [
-            (channel.get("cid", ""), channel.get("channel_name", ""))
-            for channel in channel_records
-            if channel.get("cid", "")
-        ]
-
-        users: list[Ts3OnlineUser] = []
-        for client in client_records:
-            if client.get("client_type") == "1":
-                continue
-
-            users.append(
-                Ts3OnlineUser(
-                    nickname=client.get("client_nickname", ""),
-                    channel_id=client.get("cid", ""),
-                    channel_name=channel_map.get(client.get("cid", ""), ""),
-                    client_id=client.get("clid", ""),
-                    database_id=client.get("client_database_id", ""),
-                    unique_id=client.get("client_unique_identifier", ""),
-                    client_ip=client.get("connection_client_ip", ""),
-                    connected_duration_seconds=max(
-                        0,
-                        self._safe_int(client.get("connection_connected_time"), 0) // 1000,
-                    ),
-                    away=client.get("client_away", "0") == "1",
-                )
-            )
-
-        users.sort(key=lambda item: item.nickname.casefold())
-
-        return Ts3ServerStatus(
-            server_name=serverinfo.get("virtualserver_name", ""),
-            server_host=self.host,
-            server_port=self._safe_int(serverinfo.get("virtualserver_port"), self.server_port),
-            online_count=len(users),
-            channels=channel_order,
-            users=users,
-        )
-
-    async def _execute(
-        self,
-        reader: asyncio.StreamReader,
-        writer: asyncio.StreamWriter,
-        command: str,
-        action: str,
-    ) -> list[dict[str, str]]:
-        self._debug_log("ServerQuery -> %s", command)
-        await self._write_line(writer, command)
-        lines = await self._read_response(reader)
-        return self._parse_response(lines, action)
-
-    async def _write_line(self, writer: asyncio.StreamWriter, line: str) -> None:
-        writer.write(f"{line}\n".encode("utf-8"))
-        await writer.drain()
-
-    async def _consume_welcome(self, reader: asyncio.StreamReader) -> None:
-        while True:
-            raw_line = await reader.readline()
-            if not raw_line:
-                raise Ts3QueryError("ServerQuery 握手失败：欢迎信息意外结束")
-
-            line = raw_line.decode("utf-8", errors="replace").strip("\r\n")
-            if not line:
-                continue
-
-            self._debug_log("ServerQuery welcome: %s", line)
-
-            if "TeamSpeak 3 ServerQuery interface" in line:
-                return
-
-    async def _read_response(self, reader: asyncio.StreamReader) -> list[str]:
-        lines: list[str] = []
-        while True:
-            try:
-                raw_line = await reader.readline()
-            except Exception as exc:
-                raise Ts3QueryError(f"ServerQuery 读取响应失败：{exc}") from exc
-
-            if not raw_line:
-                if lines:
-                    return lines
-                raise Ts3QueryError("ServerQuery 连接已关闭")
-
-            line = raw_line.decode("utf-8", errors="replace").strip("\r\n")
-            if not line:
-                continue
-
-            self._debug_log("ServerQuery <- %s", line)
-            lines.append(line)
-
-            if line.startswith("error "):
-                return lines
-
-    def _parse_response(self, lines: list[str], action: str) -> list[dict[str, str]]:
-        if not lines:
-            return []
-
-        error_line = lines[-1]
-        if not error_line.startswith("error "):
-            raise Ts3QueryError(f"{action} 失败：响应格式异常，缺少 error 行")
-
-        error_info = self._parse_record(error_line.removeprefix("error "))
-        try:
-            error_id = int(error_info.get("id", "-1"))
-        except (TypeError, ValueError) as exc:
-            raise Ts3QueryError(f"{action} 失败：响应格式异常，error id 无法解析") from exc
-
-        if error_id != 0:
-            error_msg = error_info.get("msg", "unknown")
-            raise Ts3QueryError(f"{action} 失败：{error_msg} (id={error_id})")
-
-        data_lines = lines[:-1]
-        if not data_lines:
-            return []
-
-        data = "\n".join(data_lines).strip()
-        if not data:
-            return []
-
-        records: list[dict[str, str]] = []
-        for raw_record in data.split("|"):
-            raw_record = raw_record.strip()
-            if raw_record:
-                records.append(self._parse_record(raw_record))
-        return records
-
-    def _parse_record(self, payload: str) -> dict[str, str]:
-        record: dict[str, str] = {}
-        for token in payload.split(" "):
-            if not token:
-                continue
-            if "=" not in token:
-                record[token] = ""
-                continue
-            key, value = token.split("=", 1)
-            record[key] = self._unescape(value)
-        return record
-
-    def _escape(self, value: str) -> str:
-        return "".join(ESCAPE_MAP.get(char, char) for char in value)
-
-    def _unescape(self, value: str) -> str:
-        chars: list[str] = []
-        index = 0
-        while index < len(value):
-            if value[index] != "\\" or index + 1 >= len(value):
-                chars.append(value[index])
-                index += 1
-                continue
-
-            escaped = value[index : index + 2]
-            chars.append(UNESCAPE_MAP.get(escaped, escaped[1]))
-            index += 2
-
-        return "".join(chars)
-
-    def _safe_int(self, value: object, default: int) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return default
-
-    def _debug_log(self, message: str, *args) -> None:
-        if self.debug:
-            logger.info("[TS3 Query] " + message, *args)
+PLUGIN_NAME = "astrbot_plugin_ts3_tracker"
 
 
 @register(
     "ts3_tracker",
     "moeneri",
-    "AstrBot TS3 查询插件，发送上号指令即可返回服务器在线信息。",
+    "查询 TeamSpeak 3 服务器在线用户，并持续推送进入、离开和在线时长通知。",
     "1.0.2",
-    "https://github.com/moeneri/astrbot_plugin_ts3_tracker",
+    "",
 )
 class Ts3TrackerPlugin(Star):
+    STATUS_COMMANDS = {"ts", "上号", "人呢"}
+    SERVER_COMMANDS = {"tsinfo", "ts服务器"}
+
     def __init__(self, context: Context, config: Optional[AstrBotConfig] = None):
         super().__init__(context)
         self.config = config or {}
+        self.storage = PluginLocalStorage(
+            self._resolve_storage_dir(),
+            legacy_base_dirs=[Path(__file__).resolve().parent / "data"],
+        )
+        self.presence_tracker = PresenceTracker(self.storage)
+        self.monitor_task: Optional[asyncio.Task] = None
+        self._recent_message_claims: dict[str, float] = {}
+        self._ensure_monitor_task()
+        logger.info("TS3 Tracker 插件已初始化，数据目录: %s", self.storage.base_dir)
 
-    @filter.command("上号", alias={"ts", "tsinfo"})
-    async def query_server_status(self, event: AstrMessageEvent):
-        """查询 TS3 服务器在线信息。"""
-        message = await self._build_server_message()
+    @filter.on_astrbot_loaded()
+    async def on_astrbot_loaded(self):
+        self._ensure_monitor_task()
+        self._debug_log("AstrBot 初始化完成，监控任务已检查启动状态")
+
+    @filter.command("ts", alias={"上号", "人呢"})
+    async def query_ts_status(self, event: AstrMessageEvent):
+        """查询当前 TS3 在线用户。"""
+        self._ensure_monitor_task()
+        if not self._claim_message(event):
+            return
+        event.stop_event()
+        message = await self._build_status_message()
+        if await self._send_text_response(event, message):
+            return
         yield event.plain_result(message)
 
-    async def _build_server_message(self) -> str:
+    @filter.command("tsinfo", alias={"ts服务器"})
+    async def query_ts_server(self, event: AstrMessageEvent):
+        """查询 TS3 服务器信息。"""
+        self._ensure_monitor_task()
+        if not self._claim_message(event):
+            return
+        event.stop_event()
+        message = await self._build_server_info_message()
+        if await self._send_text_response(event, message):
+            return
+        yield event.plain_result(message)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("tsnotify", alias={"ts监听", "ts通知"})
+    async def toggle_ts_notify(self, event: AstrMessageEvent, action: str = ""):
+        """管理员控制当前会话是否接收 TS3 进入/离开通知。"""
+        self._ensure_monitor_task()
+        if not self._claim_message(event):
+            return
+        event.stop_event()
+
+        target = getattr(event, "unified_msg_origin", "")
+        current_enabled = self.storage.is_notify_target_enabled(target)
+        normalized = action.strip().lower()
+
+        if normalized in {"", "status", "状态"}:
+            status_text = "已开启" if current_enabled else "未开启"
+            message = (
+                "当前会话的 TS3 通知监听状态：" + status_text + "\n"
+                "使用 /tsnotify on 开启\n"
+                "使用 /tsnotify off 关闭\n"
+                "也可以使用 /tsbind 和 /tsunbind"
+            )
+            if await self._send_text_response(event, message):
+                return
+            yield event.plain_result(message)
+            return
+
+        if normalized in {"on", "enable", "enabled", "open", "true", "1", "开启", "开", "订阅", "绑定"}:
+            changed = self.storage.add_notify_target(target)
+            if changed:
+                self._debug_log("Registered notify target by admin command: %s", target)
+                message = "当前会话已开启 TS3 进入/离开通知监听。"
+            else:
+                message = "当前会话已经在监听 TS3 进入/离开通知。"
+            if await self._send_text_response(event, message):
+                return
+            yield event.plain_result(message)
+            return
+
+        if normalized in {"off", "disable", "disabled", "close", "false", "0", "关闭", "关", "取消", "解绑"}:
+            changed = self.storage.disable_notify_target(target)
+            if changed:
+                self._debug_log("Disabled notify target by admin command: %s", target)
+                message = "当前会话已关闭 TS3 进入/离开通知监听。"
+            else:
+                message = "当前会话原本就没有开启 TS3 进入/离开通知监听。"
+            if await self._send_text_response(event, message):
+                return
+            yield event.plain_result(message)
+            return
+
+        message = (
+            "参数不正确。\n"
+            "使用 /tsnotify on 开启\n"
+            "使用 /tsnotify off 关闭\n"
+            "使用 /tsnotify status 查看状态"
+        )
+        if await self._send_text_response(event, message):
+            return
+        yield event.plain_result(message)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("tsbind", alias={"ts绑定", "ts开启监听"})
+    async def bind_ts_notify(self, event: AstrMessageEvent):
+        """管理员开启当前会话的 TS3 进入/离开通知监听。"""
+        if not self._claim_message(event):
+            return
+        event.stop_event()
+        changed = self.storage.add_notify_target(getattr(event, "unified_msg_origin", ""))
+        message = (
+            "当前会话已开启 TS3 进入/离开通知监听。"
+            if changed
+            else "当前会话已经在监听 TS3 进入/离开通知。"
+        )
+        if await self._send_text_response(event, message):
+            return
+        yield event.plain_result(message)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("tsunbind", alias={"ts解绑", "ts关闭监听"})
+    async def unbind_ts_notify(self, event: AstrMessageEvent):
+        """管理员关闭当前会话的 TS3 进入/离开通知监听。"""
+        if not self._claim_message(event):
+            return
+        event.stop_event()
+        changed = self.storage.disable_notify_target(getattr(event, "unified_msg_origin", ""))
+        message = (
+            "当前会话已关闭 TS3 进入/离开通知监听。"
+            if changed
+            else "当前会话原本就没有开启 TS3 进入/离开通知监听。"
+        )
+        if await self._send_text_response(event, message):
+            return
+        yield event.plain_result(message)
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("tsdbclear", alias={"ts清库", "ts清空数据库"})
+    async def clear_database(self, event: AstrMessageEvent, confirm: str = ""):
+        """清空 TS3 Tracker 数据库。使用 /tsdbclear 确认 执行。"""
+        if not self._claim_message(event):
+            return
+        event.stop_event()
+        if confirm.strip().lower() not in {"确认", "confirm", "yes"}:
+            yield event.plain_result(
+                "这是危险操作，会清空在线历史、通知目标和监控基线。\n"
+                "请使用 /tsdbclear 确认 执行。"
+            )
+            return
+
+        self.storage.clear_database()
+        self._debug_log("TS3 tracker database cleared by admin command")
+        message = (
+            "TS3 Tracker 数据库已清空。\n"
+            "已重置：在线历史、通知目标、监控基线。\n"
+            "监控开启时，下一个轮询周期会重新建立基线。"
+        )
+        if await self._send_text_response(event, message):
+            return
+        yield event.plain_result(message)
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def query_ts_status_plain(self, event: AstrMessageEvent):
+        """在启用无前缀触发时，响应 ts 和 tsserver 相关指令。"""
+        if not self._allow_plain_text_trigger():
+            return
+
+        self._ensure_monitor_task()
+        content = (event.message_str or "").strip()
+        if content in self.STATUS_COMMANDS:
+            if not self._claim_message(event):
+                return
+            event.stop_event()
+            message = await self._build_status_message()
+            if await self._send_text_response(event, message):
+                return
+            yield event.plain_result(message)
+            return
+
+        if content in self.SERVER_COMMANDS:
+            if not self._claim_message(event):
+                return
+            event.stop_event()
+            message = await self._build_server_info_message()
+            if await self._send_text_response(event, message):
+                return
+            yield event.plain_result(message)
+
+    async def _build_status_message(self) -> str:
+        status = await self._fetch_status()
+        if isinstance(status, str):
+            return status
+
+        channel_members = self._group_users_by_channel(
+            status,
+            show_duration=self._show_status_online_duration(),
+        )
+        if not channel_members:
+            return "没有人。"
+
+        lines = []
+        for channel_name, nicknames in channel_members:
+            lines.append(f"{channel_name}: {'、'.join(nicknames)}")
+        return "\n".join(lines)
+
+    async def _build_server_info_message(self) -> str:
+        status = await self._fetch_status()
+        if isinstance(status, str):
+            return status
+
+        lines = [
+            f"服务器地址：{status.server_host}",
+            f"服务器端口：{status.server_port}",
+            f"服务器名称：{status.server_name or '-'}",
+            "服务器频道：",
+        ]
+        channel_members = self._group_user_labels_by_channel(status)
+        if status.channel_names:
+            seen: set[str] = set()
+            for channel_name in status.channel_names:
+                user_labels = channel_members.get(channel_name, [])
+                if user_labels:
+                    lines.append(f"{channel_name}: {'、'.join(user_labels)}")
+                else:
+                    lines.append(channel_name)
+                seen.add(channel_name)
+            for channel_name, user_labels in channel_members.items():
+                if channel_name not in seen:
+                    lines.append(f"{channel_name}: {'、'.join(user_labels)}")
+        else:
+            lines.append("-")
+        return "\n".join(lines)
+
+    async def _monitor_loop(self) -> None:
+        while True:
+            try:
+                if not self._monitor_enabled():
+                    await asyncio.sleep(2)
+                    continue
+
+                status = await self._fetch_status()
+                if isinstance(status, str):
+                    await asyncio.sleep(self._monitor_interval_seconds())
+                    continue
+
+                events = self.presence_tracker.reconcile(status, time.time())
+                if events:
+                    await self._dispatch_presence_events(events)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # pragma: no cover - defensive guard
+                logger.exception("TS3 monitor loop failed: %s", exc)
+
+            await asyncio.sleep(self._monitor_interval_seconds())
+
+    async def _dispatch_presence_events(self, events) -> None:
+        targets = self.storage.load_notify_targets()
+        if not targets:
+            self._debug_log("Presence events detected but no notify targets are bound yet")
+            return
+
+        for event in events:
+            if event.kind == "online":
+                message = build_online_message(
+                    nickname=event.nickname,
+                    timestamp=event.start_ts,
+                    total_users=event.total_users,
+                    online_names=event.online_names,
+                )
+            else:
+                message = build_offline_message(
+                    nickname=event.nickname,
+                    start_ts=event.start_ts,
+                    end_ts=event.end_ts or event.start_ts,
+                    online_names=event.online_names,
+                )
+
+            for target in targets:
+                try:
+                    await self.context.send_message(target, MessageChain().message(message))
+                    self.storage.mark_notify_target_success(target)
+                except Exception as exc:  # pragma: no cover - platform dependent
+                    self.storage.mark_notify_target_error(target, str(exc))
+                    logger.warning("TS3 notification send failed to %s: %s", target, exc)
+
+            self._debug_log(
+                "Presence notification dispatched: %s - %s",
+                event.nickname,
+                event.kind,
+            )
+
+    async def _fetch_status(self):
         missing_fields = self._get_missing_required_fields()
         if missing_fields:
-            return "TS3 配置不完整，请先填写：" + "、".join(missing_fields)
+            return "TS3 配置不完整，请先在插件配置页填写：" + "、".join(missing_fields)
+
+        host = str(self.config.get("server_host", "")).strip()
+        server_port = self._get_int_config("server_port", 0)
+        query_port = self._get_int_config("serverquery_port", 10011)
+        username = str(self.config.get("serverquery_username", "")).strip()
+        password = str(self.config.get("serverquery_password", "")).strip()
 
         client = Ts3QueryClient(
-            host=str(self.config.get("server_host", "")).strip(),
-            server_port=self._get_int_config("server_port", 9987),
-            query_port=self._get_int_config("serverquery_port", 10011),
-            username=str(self.config.get("serverquery_username", "")).strip(),
-            password=str(self.config.get("serverquery_password", "")).strip(),
+            host=host,
+            server_port=server_port,
+            query_port=query_port,
+            username=username,
+            password=password,
             timeout=10.0,
-            debug=self._get_bool_config("debug", False),
+            debug=self._debug_enabled(),
+        )
+
+        self._debug_log(
+            "Preparing TS3 status query host=%s server_port=%s query_port=%s user=%s",
+            host,
+            server_port,
+            query_port,
+            username,
         )
 
         try:
@@ -338,80 +369,64 @@ class Ts3TrackerPlugin(Star):
             return f"TS3 查询失败：{exc}"
         except Exception as exc:  # pragma: no cover - defensive guard
             logger.exception("Unexpected TS3 query error: %s", exc)
-            return "TS3 查询失败：发生了未预期错误，请查看 AstrBot 日志。"
+            return "TS3 查询失败：发生了未预期的错误，请打开 debug 后查看日志。"
 
-        return self._format_server_status(status)
+        self.storage.save_last_status(status.to_dict())
+        self._debug_log("TS3 query succeeded with %s online clients", status.online_count)
+        return status
 
-    def _format_server_status(self, status: Ts3ServerStatus) -> str:
-        lines = [
-            f"服务器名称：{status.server_name or '-'}",
-            f"服务器地址：{status.server_host}:{status.server_port}",
-            f"在线人数：{status.online_count}",
-            "频道信息：",
-        ]
-
-        for channel_name, users in self._group_users_by_channel(status):
-            display_name = channel_name or "未命名频道"
-            if users:
-                lines.append(f"- {display_name}（{len(users)}人）：{'、'.join(users)}")
-            else:
-                lines.append(f"- {display_name}（0人）")
-
-        return "\n".join(lines)
-
-    def _group_users_by_channel(self, status: Ts3ServerStatus) -> list[tuple[str, list[str]]]:
-        grouped: dict[str, dict[str, object]] = {}
-        for channel_id, channel_name in status.channels:
-            grouped.setdefault(channel_id, {"name": channel_name, "users": []})
-
+    def _group_users_by_channel(
+        self,
+        status,
+        show_duration: bool = False,
+    ) -> list[tuple[str, list[str]]]:
+        grouped: dict[str, list[str]] = {}
         for user in status.users:
-            channel_id = user.channel_id or "__unknown__"
-            channel_entry = grouped.setdefault(
-                channel_id,
-                {"name": user.channel_name or "未命名频道", "users": []},
+            channel_name = user.channel_name or "未知频道"
+            grouped.setdefault(channel_name, []).append(
+                self._build_user_label(user, show_duration=show_duration)
             )
-            user_label = user.nickname
-            if self._get_bool_config("show_online_duration", False):
-                user_label = f"{user.nickname}({self._format_duration(user.connected_duration_seconds)})"
-            channel_entry["users"].append(user_label)
 
-        ordered_groups: list[tuple[str, list[str]]] = []
-        for channel_id, _channel_name in status.channels:
-            channel_entry = grouped.get(channel_id)
-            if channel_entry is None:
-                continue
-            ordered_groups.append((str(channel_entry["name"]), list(channel_entry["users"])))
-            grouped.pop(channel_id, None)
+        ordered: list[tuple[str, list[str]]] = []
+        seen: set[str] = set()
+        for channel_name in status.channel_names:
+            if channel_name in grouped:
+                ordered.append((channel_name, grouped[channel_name]))
+                seen.add(channel_name)
 
-        for channel_entry in grouped.values():
-            ordered_groups.append((str(channel_entry["name"]), list(channel_entry["users"])))
+        for channel_name, nicknames in grouped.items():
+            if channel_name not in seen:
+                ordered.append((channel_name, nicknames))
 
-        return ordered_groups
+        return ordered
 
-    def _format_duration(self, seconds: int) -> str:
-        total_seconds = max(0, int(seconds))
-        if total_seconds < 60:
-            return "1分钟内"
+    def _group_user_labels_by_channel(self, status) -> dict[str, list[str]]:
+        grouped: dict[str, list[str]] = {}
+        for user in status.users:
+            channel_name = user.channel_name or "未知频道"
+            grouped.setdefault(channel_name, []).append(
+                self._build_user_label(user, show_duration=True)
+            )
+        return grouped
 
-        minutes = total_seconds // 60
-        if minutes < 60:
-            return f"{minutes}分钟"
+    def _build_user_label(self, user, show_duration: bool = False) -> str:
+        nickname = str(getattr(user, "nickname", "") or "-")
+        if not show_duration:
+            return nickname
 
-        hours, remaining_minutes = divmod(minutes, 60)
-        if hours < 24:
-            if remaining_minutes:
-                return f"{hours}小时{remaining_minutes}分钟"
-            return f"{hours}小时"
+        duration = format_duration(int(getattr(user, "connected_duration_seconds", 0)))
+        return f"{nickname}({duration})"
 
-        days, remaining_hours = divmod(hours, 24)
-        if remaining_hours:
-            return f"{days}天{remaining_hours}小时"
-        return f"{days}天"
+    def _resolve_storage_dir(self) -> Path:
+        try:
+            return Path(get_astrbot_data_path()) / "plugin_data" / PLUGIN_NAME
+        except Exception:
+            return Path(__file__).resolve().parent / "data"
 
     def _get_missing_required_fields(self) -> list[str]:
         missing: list[str] = []
         if not str(self.config.get("server_host", "")).strip():
-            missing.append("服务器地址")
+            missing.append("服务器 IP")
         if self._get_int_config("server_port", 0) <= 0:
             missing.append("服务器端口")
         if not str(self.config.get("serverquery_username", "")).strip():
@@ -434,8 +449,96 @@ class Ts3TrackerPlugin(Star):
             return bool(value)
         if isinstance(value, str):
             normalized = value.strip().lower()
-            if normalized in {"1", "true", "yes", "on", "enabled"}:
+            if normalized in {"1", "true", "yes", "y", "on", "enabled"}:
                 return True
-            if normalized in {"0", "false", "no", "off", "disabled"}:
+            if normalized in {"0", "false", "no", "n", "off", "disabled"}:
                 return False
         return default
+
+    def _allow_plain_text_trigger(self) -> bool:
+        return self._get_bool_config("enable_plain_text_trigger", False)
+
+    def _monitor_enabled(self) -> bool:
+        return self._get_bool_config("enable_monitor", False)
+
+    def _monitor_interval_seconds(self) -> int:
+        interval = self._get_int_config("monitor_interval_seconds", 5)
+        return max(5, interval)
+
+    def _debug_enabled(self) -> bool:
+        return self._get_bool_config("debug", False)
+
+    def _show_status_online_duration(self) -> bool:
+        return self._get_bool_config("show_online_duration_in_status", False)
+
+    def _ensure_monitor_task(self) -> None:
+        if self.monitor_task and not self.monitor_task.done():
+            return
+
+        if self.monitor_task and self.monitor_task.done():
+            try:
+                exc = self.monitor_task.exception()
+            except asyncio.CancelledError:
+                exc = None
+            if exc:
+                logger.warning("TS3 monitor task exited with error, restarting: %s", exc)
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        self.monitor_task = loop.create_task(self._monitor_loop())
+        self._debug_log("TS3 monitor task started")
+
+    def _claim_message(self, event: AstrMessageEvent) -> bool:
+        now = time.monotonic()
+        expired_keys = [
+            key for key, ts in self._recent_message_claims.items() if now - ts > 15
+        ]
+        for key in expired_keys:
+            self._recent_message_claims.pop(key, None)
+
+        message_obj = getattr(event, "message_obj", None)
+        message_id = getattr(message_obj, "message_id", "") if message_obj else ""
+        session_id = getattr(message_obj, "session_id", "") if message_obj else ""
+        timestamp = getattr(message_obj, "timestamp", "") if message_obj else ""
+        content = (event.message_str or "").strip()
+        claim_key = "|".join(
+            [
+                str(getattr(event, "unified_msg_origin", "")),
+                str(session_id),
+                str(message_id),
+                str(timestamp),
+                content,
+            ]
+        )
+
+        if self._recent_message_claims.get(claim_key):
+            self._debug_log("Duplicate message ignored: %s", claim_key)
+            return False
+
+        self._recent_message_claims[claim_key] = now
+        return True
+
+    def _debug_log(self, message: str, *args) -> None:
+        if self._debug_enabled():
+            logger.info("[TS3 Tracker] " + message, *args)
+
+    async def _send_text_response(self, event: AstrMessageEvent, text: str) -> bool:
+        target = getattr(event, "unified_msg_origin", "")
+        if not target:
+            return False
+
+        try:
+            await self.context.send_message(target, MessageChain().message(text))
+            return True
+        except Exception as exc:  # pragma: no cover - platform dependent
+            self._debug_log("Direct response send failed, fallback to plain_result: %s", exc)
+            return False
+
+    async def terminate(self):
+        if self.monitor_task:
+            self.monitor_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self.monitor_task
