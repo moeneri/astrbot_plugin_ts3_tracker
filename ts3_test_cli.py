@@ -273,12 +273,14 @@ def format_status(payload: dict[str, Any]) -> str:
     seen: set[str] = set()
     for channel_name in payload.get("channel_names", []):
         if channel_name in grouped:
-            lines.append(f"{channel_name}: {'、'.join(grouped[channel_name])}")
+            lines.append(f"{channel_name}:")
+            lines.extend(grouped[channel_name])
             seen.add(channel_name)
 
     for channel_name, nicknames in grouped.items():
         if channel_name not in seen:
-            lines.append(f"{channel_name}: {'、'.join(nicknames)}")
+            lines.append(f"{channel_name}:")
+            lines.extend(nicknames)
     return "\n".join(lines)
 
 

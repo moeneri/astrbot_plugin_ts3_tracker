@@ -2,7 +2,7 @@ name: astrbot_plugin_ts3_tracker
 display_name: TeamSpeak 3 查询监控通知插件
 author: moeneri
 description: 拥有 TeamSpeak 3 在线状态查询、频道成员展示、上下线通知的功能。
-version: 1.0.3
+version: 1.0.4
 repo: "https://github.com/moeneri/astrbot_plugin_ts3_tracker"
 astrbot_version: ">=4.16,<5"
 support_platforms:

@@ -129,7 +129,7 @@ class Ts3TrackerPluginTests(unittest.TestCase):
         plugin._fetch_status = fake_fetch_status
 
         message = asyncio.run(plugin._build_status_message())
-        self.assertEqual(message, "APEX: test")
+        self.assertEqual(message, "APEX:\ntest")
 
     def test_status_message_with_duration_toggle(self):
         plugin = _make_plugin({"show_online_duration_in_status": True})
@@ -150,7 +150,33 @@ class Ts3TrackerPluginTests(unittest.TestCase):
         plugin._fetch_status = fake_fetch_status
 
         message = asyncio.run(plugin._build_status_message())
-        self.assertEqual(message, "APEX: test(23分钟)")
+        self.assertEqual(message, "APEX:\ntest(23分钟)")
+
+    def test_status_message_puts_each_user_on_own_line(self):
+        plugin = _make_plugin({"show_online_duration_in_status": True})
+        status = SimpleNamespace(
+            users=[
+                SimpleNamespace(
+                    nickname="alpha",
+                    channel_name="APEX",
+                    connected_duration_seconds=60,
+                ),
+                SimpleNamespace(
+                    nickname="bravo",
+                    channel_name="APEX",
+                    connected_duration_seconds=3600,
+                ),
+            ],
+            channel_names=["APEX"],
+        )
+
+        async def fake_fetch_status():
+            return status
+
+        plugin._fetch_status = fake_fetch_status
+
+        message = asyncio.run(plugin._build_status_message())
+        self.assertEqual(message, "APEX:\nalpha(1分钟)\nbravo(1小时)")
 
     def test_group_whitelist_allows_private_chat(self):
         plugin = _make_plugin(

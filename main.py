@@ -48,7 +48,7 @@ PLUGIN_NAME = "astrbot_plugin_ts3_tracker"
     "ts3_tracker",
     "moeneri",
     "拥有 TeamSpeak 3 在线状态查询、频道成员展示、上下线通知的功能。",
-    "1.0.3",
+    "1.0.4",
     "",
 )
 class Ts3TrackerPlugin(Star):
@@ -273,7 +273,8 @@ class Ts3TrackerPlugin(Star):
 
         lines = []
         for channel_name, nicknames in channel_members:
-            lines.append(f"{channel_name}: {'、'.join(nicknames)}")
+            lines.append(f"{channel_name}:")
+            lines.extend(nicknames)
         return "\n".join(lines)
 
     async def _build_server_info_message(self) -> str:
